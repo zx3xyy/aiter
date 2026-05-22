@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+from typing import Optional
+
 import torch
 from torch import Tensor
-from typing import Optional
-from ..jit.core import compile_ops, AITER_CSRC_DIR
-from .enum import ActivationType, Enum, QuantType
+
+from ..jit.core import AITER_CSRC_DIR, compile_ops
 from ..utility import dtypes
-import functools
+from .enum import ActivationType, Enum, QuantType
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
@@ -275,6 +277,7 @@ def cmdGenFunc_ck_moe_stage2(
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
     is_shuffled: bool = True,
+    do_finalize: bool = True,
 ):
 
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
@@ -338,6 +341,7 @@ def ck_moe_stage2(
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
     is_shuffled: bool = True,
+    do_finalize: bool = True,
 ) -> None: ...
 
 
@@ -593,6 +597,7 @@ def ck_moe_stage2_fwd(
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
     use_non_temporal_load: Optional[bool] = False,
+    do_finalize: bool = True,
 ):
     ck_moe_stage2(
         inter_states,
@@ -612,5 +617,6 @@ def ck_moe_stage2_fwd(
         activation.value,
         use_non_temporal_load=use_non_temporal_load,
         is_shuffled=getattr(w2, "is_shuffled", False),
+        do_finalize=do_finalize,
     )
     return out

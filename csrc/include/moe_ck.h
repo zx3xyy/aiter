@@ -36,10 +36,11 @@ void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    std::optional<torch::Tensor> w2_scale, // [e, 1, n], gate(up) scale
                    std::optional<torch::Tensor> a2_scale, // [m, 1], token scale
                    std::optional<int> block_m,
-                   std::optional<torch::Tensor> sorted_weights, // [max_num_tokens_padded]);
+                   std::optional<torch::Tensor> sorted_weights, // [max_num_tokens_padded]
                    int quant_type,
                    int activation,
                    std::optional<int> splitk,
                    bool nt,
                    std::optional<std::string> dst_type,
-                   bool is_shuffled);
+                   bool is_shuffled,
+                   bool do_finalize);

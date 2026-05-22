@@ -135,7 +135,8 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    std::optional<int> splitk = 1,
                    bool nt = false,
                    std::optional<std::string> dst_type = std::nullopt,
-                   bool is_shuffled = true)
+                   bool is_shuffled = true,
+                   bool do_finalize = true)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage2 called!" << nt << " " << block_m.value() << std::endl;
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
@@ -144,7 +145,21 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     int32_t splitk_local = splitk.has_value() ? splitk.value() : 1;
 
     int tokens = inter_states.size(0);
-    int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
+    int kernel_topk = topk;
+    if (!do_finalize)
+    {
+        TORCH_CHECK(inter_states.dim() == 3,
+                    "ck_moe_stage2(do_finalize=False) expects inter_states [tokens, topk, K]");
+        TORCH_CHECK(out.dim() == 3,
+                    "ck_moe_stage2(do_finalize=False) expects out [tokens, topk, N]");
+        TORCH_CHECK(inter_states.is_contiguous() && out.is_contiguous(),
+                    "ck_moe_stage2(do_finalize=False) expects contiguous inter_states and out");
+        TORCH_CHECK(inter_states.size(1) == topk && out.size(0) == inter_states.size(0) && out.size(1) == topk,
+                    "ck_moe_stage2(do_finalize=False) shape mismatch");
+        tokens = inter_states.size(0) * inter_states.size(1);
+        kernel_topk = 1;
+    }
+    int sorted_size = std::min(int64_t(tokens * kernel_topk * block_m.value()), sorted_token_ids.size(0));
     int E = w1.size(0);
     int N = w2.size(1);
     int K = inter_states.size(-1);
@@ -176,6 +191,6 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
     kernel(at::hip::getCurrentHIPStream(),
-           tokens, sorted_size, N, K, topk,
+           tokens, sorted_size, N, K, kernel_topk,
            inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt);
 }
