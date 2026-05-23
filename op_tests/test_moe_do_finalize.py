@@ -30,6 +30,11 @@ def _make_bf16_case(token_num=16, hidden_dim=128, inter_dim=128, expert_num=4, t
     return hidden_states, w1, w2, topk_weight, topk_ids
 
 
+def _make_random_unique_topk_ids(token_num, expert_num, topk):
+    scores = torch.rand((token_num, expert_num), device="cuda")
+    return torch.topk(scores, topk, dim=1).indices.to(dtypes.i32)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 def test_fused_moe_do_finalize_false_returns_unweighted_route_outputs():
     torch.manual_seed(0)
@@ -147,6 +152,53 @@ def test_fused_moe_do_finalize_false_weighted_sum_matches_finalized_output():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_fused_moe_do_finalize_false_topk8_finalize_matches():
+    topk = 8
+    torch.manual_seed(100 + topk)
+    token_num = 256
+    hidden_dim = 128
+    inter_dim = 128
+    expert_num = 8
+    dtype = dtypes.bf16
+
+    hidden_states = torch.randn((token_num, hidden_dim), dtype=dtype, device="cuda")
+    w1 = torch.randn((expert_num, inter_dim, hidden_dim), dtype=dtype, device="cuda")
+    w2 = torch.randn((expert_num, hidden_dim, inter_dim), dtype=dtype, device="cuda")
+    topk_ids = _make_random_unique_topk_ids(token_num, expert_num, topk)
+    topk_weight = torch.rand((token_num, topk), dtype=dtypes.fp32, device="cuda")
+
+    w1_aiter = shuffle_weight(w1, layout=(16, 16))
+    w2_aiter = shuffle_weight(w2, layout=(16, 16))
+    route_outputs = fused_moe(
+        hidden_states,
+        w1_aiter,
+        w2_aiter,
+        topk_weight,
+        topk_ids,
+        activation=aiter.ActivationType.Silu,
+        do_finalize=False,
+    )
+    combined_output = fused_moe(
+        hidden_states,
+        w1_aiter,
+        w2_aiter,
+        topk_weight,
+        topk_ids,
+        activation=aiter.ActivationType.Silu,
+        do_finalize=True,
+    )
+
+    torch.cuda.synchronize()
+    manual_combined = (route_outputs.float() * topk_weight[..., None]).sum(dim=1)
+    diff = manual_combined - combined_output.float()
+
+    assert torch.isfinite(route_outputs).all()
+    assert torch.isfinite(combined_output).all()
+    assert diff.norm() / combined_output.float().norm() < 0.02
+    assert diff.abs().max() < 128
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 def test_fused_moe_do_finalize_false_respects_expert_mask():
     torch.manual_seed(3)
     hidden_states, w1, w2, topk_weight, topk_ids = _make_bf16_case()
@@ -217,7 +269,7 @@ def test_fused_moe_do_finalize_false_does_not_reenter_fused_moe(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_fused_moe_do_finalize_false_sorts_once(monkeypatch):
+def test_fused_moe_do_finalize_false_uses_route_sort_for_correctness(monkeypatch):
     torch.manual_seed(4)
     hidden_states, w1, w2, topk_weight, topk_ids = _make_bf16_case(token_num=256)
     w1_aiter = shuffle_weight(w1, layout=(16, 16))
@@ -244,7 +296,7 @@ def test_fused_moe_do_finalize_false_sorts_once(monkeypatch):
         do_finalize=False,
     )
 
-    assert call_count == 1
+    assert call_count == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")

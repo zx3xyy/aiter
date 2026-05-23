@@ -768,10 +768,37 @@ def _needs_swiglu_bias_support(dtype, quant_type):
     return dtype in [dtypes.bf16, dtypes.fp16] and quant_type == QuantType.per_1x32
 
 
-def _make_route_token_ids(sorted_token_ids: torch.Tensor, topk: int) -> torch.Tensor:
+def _mask_invalid_sorted_route_ids(
+    sorted_token_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     token_ids = torch.bitwise_and(sorted_token_ids, 0x00FFFFFF)
     topk_ids = torch.bitwise_right_shift(sorted_token_ids, 24)
-    return token_ids * topk + topk_ids
+    row_ids = torch.arange(
+        sorted_token_ids.numel(),
+        dtype=num_valid_ids.dtype,
+        device=sorted_token_ids.device,
+    )
+    valid = torch.logical_and(
+        row_ids < num_valid_ids[0],
+        torch.logical_and(token_ids < token_num, topk_ids < topk),
+    )
+    invalid = torch.logical_not(valid)
+    sorted_token_ids.masked_fill_(invalid, 0)
+    sorted_weights.masked_fill_(invalid, 0.0)
+    block_ids = torch.arange(
+        sorted_expert_ids.numel(),
+        dtype=sorted_expert_ids.dtype,
+        device=sorted_expert_ids.device,
+    )
+    valid_blocks = block_ids * int(block_size) < num_valid_ids[0]
+    sorted_expert_ids.masked_fill_(torch.logical_not(valid_blocks), 0)
+    return sorted_token_ids, sorted_weights, sorted_expert_ids
 
 
 def _normalize_bias_for_kernel(
@@ -1611,19 +1638,55 @@ def fused_moe_2stages(
     stage2_token_num = token_num
     stage2_topk_for_quant = topk
     if not do_finalize:
-        stage2_sorted_ids = _make_route_token_ids(sorted_ids, topk)
-        stage2_sorted_weights = None
-        stage2_token_num = token_num * topk
-        stage2_topk_for_quant = 1
-        # The removed route-level sort used to keep an equivalent MoE buffer
-        # alive here. CK stage1 is sensitive to that allocation pattern before
-        # writing a2, so keep the scratch without launching the extra sort.
-        stage2_scratch = torch.empty(
-            (stage2_token_num, model_dim), dtype=dtype, device=device
+        if route_topk_ids is None or topk_weights is None:
+            raise ValueError(
+                "do_finalize=False requires route_topk_ids and topk_weights"
+            )
+        route_topk_ids = route_topk_ids.reshape(token_num * topk, 1).contiguous()
+        route_topk_weights = torch.ones(
+            (token_num * topk, 1),
+            dtype=topk_weights.dtype,
+            device=topk_weights.device,
         )
-        stage2_scratch.record_stream(torch.cuda.current_stream(device))
+        (
+            stage2_sorted_ids,
+            stage2_sorted_weights,
+            stage2_sorted_expert_ids,
+            stage2_num_valid_ids,
+            _,
+        ) = moe_sorting(
+            route_topk_ids,
+            route_topk_weights,
+            global_E if global_E is not None else E,
+            model_dim,
+            dtype,
+            block_size_M,
+            expert_mask,
+            None,
+            moe_sorting_dispatch_policy,
+        )
+        stage2_token_num = token_num * topk
+        (
+            stage2_sorted_ids,
+            stage2_sorted_weights,
+            stage2_sorted_expert_ids,
+        ) = _mask_invalid_sorted_route_ids(
+            stage2_sorted_ids,
+            stage2_sorted_weights,
+            stage2_sorted_expert_ids,
+            stage2_num_valid_ids,
+            stage2_token_num,
+            1,
+            block_size_M,
+        )
+        stage2_valid_size = int(stage2_num_valid_ids[0].item())
+        stage2_valid_blocks = (stage2_valid_size + block_size_M - 1) // block_size_M
+        stage2_sorted_ids = stage2_sorted_ids[:stage2_valid_size]
+        stage2_sorted_weights = stage2_sorted_weights[:stage2_valid_size]
+        stage2_sorted_expert_ids = stage2_sorted_expert_ids[:stage2_valid_blocks]
+        stage2_topk_for_quant = 1
         moe_out = torch.zeros(
-            (token_num, topk, model_dim), dtype=dtype, device=device
+            (stage2_token_num, model_dim), dtype=dtype, device=device
         )
     if (
         quant_type == QuantType.per_1x32
@@ -1815,17 +1878,20 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    stage2_a2 = a2
+    stage2_topk_arg = topk
     if not do_finalize:
-        extra_stage2_args["do_finalize"] = False
+        stage2_a2 = a2.reshape(stage2_token_num, inter_dim)
+        stage2_topk_arg = 1
     metadata.stage2(
-        a2,
+        stage2_a2,
         w1,
         w2,
         stage2_sorted_ids,
         stage2_sorted_expert_ids,
         stage2_num_valid_ids,
         moe_out,
-        topk,
+        stage2_topk_arg,
         w2_scale=(
             w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
         ),
@@ -1836,6 +1902,9 @@ def fused_moe_2stages(
         ),
         **extra_stage2_args,
     )
+    if not do_finalize:
+        torch.cuda.synchronize()
+        moe_out = moe_out.view(token_num, topk, model_dim)
 
     return moe_out
 
