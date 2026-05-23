@@ -217,6 +217,37 @@ def test_fused_moe_do_finalize_false_does_not_reenter_fused_moe(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_fused_moe_do_finalize_false_sorts_once(monkeypatch):
+    torch.manual_seed(4)
+    hidden_states, w1, w2, topk_weight, topk_ids = _make_bf16_case(token_num=256)
+    w1_aiter = shuffle_weight(w1, layout=(16, 16))
+    w2_aiter = shuffle_weight(w2, layout=(16, 16))
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    original_moe_sorting = fused_moe_module.moe_sorting
+    call_count = 0
+
+    def wrapped_moe_sorting(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_moe_sorting(*args, **kwargs)
+
+    monkeypatch.setattr(fused_moe_module, "moe_sorting", wrapped_moe_sorting)
+
+    fused_moe_module.fused_moe(
+        hidden_states,
+        w1_aiter,
+        w2_aiter,
+        topk_weight,
+        topk_ids,
+        activation=aiter.ActivationType.Silu,
+        do_finalize=False,
+    )
+
+    assert call_count == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 def test_fused_moe_do_finalize_false_handles_zero_tokens():
     hidden_states = torch.empty((0, 128), dtype=dtypes.bf16, device="cuda")
     w1 = torch.randn((4, 128, 128), dtype=dtypes.bf16, device="cuda")
