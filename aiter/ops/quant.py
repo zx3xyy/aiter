@@ -657,7 +657,7 @@ def mxfp4_moe_sort_fwd(
     token_num: int,
     cols: int,
 ):
-    out_scale = torch.empty(
+    out_scale = torch.zeros(
         (sorted_ids.shape[0] + 31) // 32 * 32,
         (cols + 31) // 32,
         dtype=dtypes.fp8_e8m0,
@@ -769,7 +769,9 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     M, N = input.view(-1, input.shape[-1]).shape
     is_stage1 = M == token_num
     topk = 1 if is_stage1 else topk
-    scale = torch.empty(
+    # The HIP sort kernel only writes valid sublanes in the shuffled scale
+    # layout; masked sublanes must be zero because FlyDSL vector-loads them.
+    scale = torch.zeros(
         (sorted_ids.shape[0] + 31) // 32 * 32,
         (N + 31) // 32,
         dtype=dtypes.fp8_e8m0,
@@ -818,7 +820,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     M, N = input.view(-1, input.shape[-1]).shape
     N_o = (N + 31) // 32
     out = torch.empty(M, N, dtype=dtypes.fp8, device=input.device)
-    scale = torch.empty(
+    scale = torch.zeros(
         (sorted_ids.shape[0] + 31) // 32 * 32,
         N_o,
         dtype=dtypes.fp8_e8m0,
